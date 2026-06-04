@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Starter CloudFormation template to deploy SkillChain to ECS Fargate behind an ALB. Customize before use."
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC Id where ECS and ALB will be created
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnets for the ALB and ECS tasks (2+ subnets recommended)
+  ContainerImage:
+    Type: String
+    Description: ECR image URI (e.g. <account>.dkr.ecr.<region>.amazonaws.com/skillchain:latest)
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for HTTPS listener
+  DBSecretArn:
+    Type: String
+    Description: Secrets Manager ARN containing DATABASE_URL and other secrets
+
+Resources:
+  SkillCluster:
+    Type: AWS::ECS::Cluster
+    Properties: {}
+
+  SkillLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/skillchain
+
+  SkillTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  SkillTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: skillchain-task
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt SkillTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: skillchain
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Ref DBSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/skillchain
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: ecs
+
+  SkillServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for SkillChain service
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  SkillALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref SkillServiceSecurityGroup
+
+  SkillTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+
+  SkillListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 443
+      Protocol: HTTPS
+      LoadBalancerArn: !Ref SkillALB
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SkillTargetGroup
+
+  SkillService:
+    Type: AWS::ECS::Service
+    DependsOn: SkillListener
+    Properties:
+      Cluster: !Ref SkillCluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref SkillTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SkillServiceSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - TargetGroupArn: !Ref SkillTargetGroup
+          ContainerName: skillchain
+          ContainerPort: 3000
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name for the load balancer
+    Value: !GetAtt SkillALB.DNSName
